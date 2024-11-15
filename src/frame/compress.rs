@@ -8,13 +8,16 @@ use twox_hash::XxHash32;
 use crate::{
     block::{
         compress::compress_internal,
-        hashtable::{HashTable, HashTableU32},
+        hashtable::{HashTable, HashTable4K},
     },
     sink::vec_sink_for_compression,
 };
 
-use super::header::{BlockInfo, BlockMode, FrameInfo, BLOCK_INFO_SIZE, MAX_FRAME_INFO_SIZE};
 use super::Error;
+use super::{
+    header::{BlockInfo, BlockMode, FrameInfo, BLOCK_INFO_SIZE, MAX_FRAME_INFO_SIZE},
+    BlockSize,
+};
 use crate::block::WINDOW_SIZE;
 
 /// A writer for compressing a LZ4 stream.
@@ -27,7 +30,11 @@ use crate::block::WINDOW_SIZE;
 /// writer in a `std::io::BufWriter`.
 ///
 /// To ensure a well formed stream the encoder must be finalized by calling
-/// either `finish` or `try_finish()` methods.
+/// either the [`finish()`], [`try_finish()`], or [`auto_finish()`] methods.
+///
+/// [`finish()`]: Self::finish
+/// [`try_finish()`]: Self::try_finish
+/// [`auto_finish()`]: Self::auto_finish
 ///
 /// # Example 1
 /// Serializing json values into a compressed file.
@@ -67,7 +74,7 @@ pub struct FrameEncoder<W: io::Write> {
     /// _Not_ the same as `content_len` as this is reset every to 2GB.
     src_stream_offset: usize,
     /// Encoder table
-    compression_table: HashTableU32,
+    compression_table: HashTable4K,
     /// The underlying writer.
     w: W,
     /// Xxhash32 used when content checksum is enabled.
@@ -79,15 +86,16 @@ pub struct FrameEncoder<W: io::Write> {
     dst: Vec<u8>,
     /// Whether we have an open frame in the output.
     is_frame_open: bool,
+    /// Whether we have an frame closed in the output.
+    data_to_frame_written: bool,
     /// The frame information to be used in this encoder.
     frame_info: FrameInfo,
 }
 
 impl<W: io::Write> FrameEncoder<W> {
-    /// Creates a new Encoder with the specified FrameInfo.
-    pub fn with_frame_info(frame_info: FrameInfo, wtr: W) -> Self {
-        let max_block_size = frame_info.block_size.get_size();
-        let src_size = if frame_info.block_mode == BlockMode::Linked {
+    fn init(&mut self) {
+        let max_block_size = self.frame_info.block_size.get_size();
+        let src_size = if self.frame_info.block_mode == BlockMode::Linked {
             // In linked mode we consume the input (bumping src_start) but leave the
             // beginning of src to be used as a prefix in subsequent blocks.
             // That is at least until we have at least `max_block_size + WINDOW_SIZE`
@@ -99,22 +107,42 @@ impl<W: io::Write> FrameEncoder<W> {
         } else {
             max_block_size
         };
-        let src = Vec::with_capacity(src_size);
-        let dst = Vec::with_capacity(crate::block::compress::get_maximum_output_size(
-            max_block_size,
-        ));
+        // Since this method is called potentially multiple times, don't reserve _additional_
+        // capacity if not required.
+        self.src
+            .reserve(src_size.saturating_sub(self.src.capacity()));
+        self.dst.reserve(
+            crate::block::compress::get_maximum_output_size(max_block_size)
+                .saturating_sub(self.dst.capacity()),
+        );
+    }
 
-        // 16 KB hash table for matches, same as the reference implementation.
-        let (dict_size, dict_bitshift) = (4 * 1024, 4);
+    /// Returns a wrapper around `self` that will finish the stream on drop.
+    ///
+    /// # Note
+    /// Errors on drop get silently ignored. If you want to handle errors then use [`finish()`] or
+    /// [`try_finish()`] instead.
+    ///
+    /// [`finish()`]: Self::finish
+    /// [`try_finish()`]: Self::try_finish
+    pub fn auto_finish(self) -> AutoFinishEncoder<W> {
+        AutoFinishEncoder {
+            encoder: Some(self),
+        }
+    }
 
+    /// Creates a new Encoder with the specified FrameInfo.
+    pub fn with_frame_info(frame_info: FrameInfo, wtr: W) -> Self {
         FrameEncoder {
-            src,
+            src: Vec::new(),
             w: wtr,
-            compression_table: HashTableU32::new(dict_size, dict_bitshift),
+            // 16 KB hash table for matches, same as the reference implementation.
+            compression_table: HashTable4K::new(),
             content_hasher: XxHash32::with_seed(0),
             content_len: 0,
-            dst,
+            dst: Vec::new(),
             is_frame_open: false,
+            data_to_frame_written: false,
             frame_info,
             src_start: 0,
             src_end: 0,
@@ -140,17 +168,26 @@ impl<W: io::Write> FrameEncoder<W> {
         Ok(self.w)
     }
 
-    /// Attempt to finish this output stream, flushing internal buffer and writing stream terminator.
+    /// Attempt to finish this output stream, flushing internal buffer and writing stream
+    /// terminator.
     pub fn try_finish(&mut self) -> Result<(), Error> {
         match self.flush() {
-            Ok(()) if self.is_frame_open => self.end_frame(),
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Empty input special case
+                // https://github.com/ouch-org/ouch/pull/163#discussion_r1108965151
+                if !self.is_frame_open && !self.data_to_frame_written {
+                    self.begin_frame(0)?;
+                }
+                self.end_frame()?;
+                self.data_to_frame_written = true;
+                Ok(())
+            }
             Err(err) => Err(err.into()),
         }
     }
 
     /// Returns the underlying writer _without_ flushing the stream.
-    /// This may lave the output in an unfinished state.
+    /// This may leave the output in an unfinished state.
     pub fn into_inner(self) -> W {
         self.w
     }
@@ -194,8 +231,12 @@ impl<W: io::Write> FrameEncoder<W> {
 
     /// Begin the frame by writing the frame header.
     /// It'll also setup the encoder for compressing blocks for the the new frame.
-    fn begin_frame(&mut self) -> io::Result<()> {
+    fn begin_frame(&mut self, buf_len: usize) -> io::Result<()> {
         self.is_frame_open = true;
+        if self.frame_info.block_size == BlockSize::Auto {
+            self.frame_info.block_size = BlockSize::from_buf_length(buf_len);
+        }
+        self.init();
         let mut frame_info_buffer = [0u8; MAX_FRAME_INFO_SIZE];
         let size = self.frame_info.write(&mut frame_info_buffer)?;
         self.w.write_all(&frame_info_buffer[..size])?;
@@ -238,7 +279,7 @@ impl<W: io::Write> FrameEncoder<W> {
 
         let compress_result = if self.ext_dict_len != 0 {
             debug_assert_eq!(self.frame_info.block_mode, BlockMode::Linked);
-            compress_internal::<_, _, true>(
+            compress_internal::<_, true, _>(
                 input,
                 self.src_start,
                 &mut vec_sink_for_compression(&mut self.dst, 0, 0, dst_required_size),
@@ -247,7 +288,7 @@ impl<W: io::Write> FrameEncoder<W> {
                 self.src_stream_offset,
             )
         } else {
-            compress_internal::<_, _, false>(
+            compress_internal::<_, false, _>(
                 input,
                 self.src_start,
                 &mut vec_sink_for_compression(&mut self.dst, 0, 0, dst_required_size),
@@ -303,7 +344,8 @@ impl<W: io::Write> FrameEncoder<W> {
             } else if self.src_start + self.ext_dict_len > WINDOW_SIZE {
                 // There's more than WINDOW_SIZE bytes of lookback adding the prefix and ext_dict.
                 // Since we have a limited buffer we must shrink ext_dict in favor of the prefix,
-                // so that we can fit up to max_block_size bytes between dst_start and ext_dict start.
+                // so that we can fit up to max_block_size bytes between dst_start and ext_dict
+                // start.
                 let delta = self
                     .ext_dict_len
                     .min(self.src_start + self.ext_dict_len - WINDOW_SIZE);
@@ -334,13 +376,12 @@ impl<W: io::Write> FrameEncoder<W> {
 impl<W: io::Write> io::Write for FrameEncoder<W> {
     fn write(&mut self, mut buf: &[u8]) -> io::Result<usize> {
         if !self.is_frame_open && !buf.is_empty() {
-            self.begin_frame()?;
+            self.begin_frame(buf.len())?;
         }
         let buf_len = buf.len();
-        let max_block_size = self.frame_info.block_size.get_size();
         while !buf.is_empty() {
             let src_filled = self.src_end - self.src_start;
-            let max_fill_len = max_block_size - src_filled;
+            let max_fill_len = self.frame_info.block_size.get_size() - src_filled;
             if max_fill_len == 0 {
                 // make space by writing next block
                 self.write_block()?;
@@ -364,6 +405,40 @@ impl<W: io::Write> io::Write for FrameEncoder<W> {
     }
 }
 
+/// A wrapper around an [`FrameEncoder<W>`] that finishes the stream on drop.
+///
+/// This can be created by the [`auto_finish()`] method on the [`FrameEncoder<W>`].
+///
+/// # Note
+/// Errors on drop get silently ignored. If you want to handle errors then use [`finish()`] or
+/// [`try_finish()`] instead.
+///
+/// [`finish()`]: FrameEncoder::finish
+/// [`try_finish()`]: FrameEncoder::try_finish
+/// [`auto_finish()`]: FrameEncoder::auto_finish
+pub struct AutoFinishEncoder<W: Write> {
+    // We wrap this in an option to take it during drop.
+    encoder: Option<FrameEncoder<W>>,
+}
+
+impl<W: io::Write> Drop for AutoFinishEncoder<W> {
+    fn drop(&mut self) {
+        if let Some(mut encoder) = self.encoder.take() {
+            let _ = encoder.try_finish();
+        }
+    }
+}
+
+impl<W: Write> Write for AutoFinishEncoder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.encoder.as_mut().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.encoder.as_mut().unwrap().flush()
+    }
+}
+
 impl<W: fmt::Debug + io::Write> fmt::Debug for FrameEncoder<W> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("FrameEncoder")
@@ -372,6 +447,8 @@ impl<W: fmt::Debug + io::Write> fmt::Debug for FrameEncoder<W> {
             .field("is_frame_open", &self.is_frame_open)
             .field("content_hasher", &self.content_hasher)
             .field("content_len", &self.content_len)
+            .field("compression_table", &"{ ... }")
+            .field("data_to_frame_written", &self.data_to_frame_written)
             .field("dst", &"[...]")
             .field("src", &"[...]")
             .field("src_start", &self.src_start)
@@ -383,14 +460,14 @@ impl<W: fmt::Debug + io::Write> fmt::Debug for FrameEncoder<W> {
     }
 }
 
-/// Copy `src` into `v` starting from the `start` index, overwriting existing data if any.
+/// Copy `src` into `target` starting from the `start` index, overwriting existing data if any.
 #[inline]
-fn vec_copy_overwriting(v: &mut Vec<u8>, start: usize, src: &[u8]) {
-    debug_assert!(start + src.len() <= v.capacity());
+fn vec_copy_overwriting(target: &mut Vec<u8>, target_start: usize, src: &[u8]) {
+    debug_assert!(target_start + src.len() <= target.capacity());
 
     // By combining overwriting (copy_from_slice) and extending (extend_from_slice)
     // we can fill the ring buffer without initializing it (eg. filling with 0).
-    let overwrite_len = (v.len() - start).min(src.len());
-    v[start..start + overwrite_len].copy_from_slice(&src[..overwrite_len]);
-    v.extend_from_slice(&src[overwrite_len..]);
+    let overwrite_len = (target.len() - target_start).min(src.len());
+    target[target_start..target_start + overwrite_len].copy_from_slice(&src[..overwrite_len]);
+    target.extend_from_slice(&src[overwrite_len..]);
 }

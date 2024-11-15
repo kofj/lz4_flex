@@ -2,7 +2,6 @@ use twox_hash::XxHash32;
 
 use super::Error;
 use std::{
-    convert::TryInto,
     fmt::Debug,
     hash::Hasher,
     io,
@@ -26,41 +25,64 @@ const BD_BLOCK_SIZE_MASK_RSHIFT: u8 = 4;
 const BLOCK_UNCOMPRESSED_SIZE_BIT: u32 = 0x80000000;
 
 const LZ4F_MAGIC_NUMBER: u32 = 0x184D2204;
+pub(crate) const LZ4F_LEGACY_MAGIC_NUMBER: u32 = 0x184C2102;
 const LZ4F_SKIPPABLE_MAGIC_RANGE: std::ops::RangeInclusive<u32> = 0x184D2A50..=0x184D2A5F;
 
+pub(crate) const MAGIC_NUMBER_SIZE: usize = 4;
 pub(crate) const MIN_FRAME_INFO_SIZE: usize = 7;
 pub(crate) const MAX_FRAME_INFO_SIZE: usize = 19;
 pub(crate) const BLOCK_INFO_SIZE: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
+/// Different predefines blocksizes to choose when compressing data.
+#[derive(Default)]
 pub enum BlockSize {
+    /// Will detect optimal frame size based on the size of the first write call
+    #[default]
+    Auto = 0,
     /// The default block size.
     Max64KB = 4,
+    /// 256KB block size.
     Max256KB = 5,
+    /// 1MB block size.
     Max1MB = 6,
+    /// 4MB block size.
     Max4MB = 7,
-}
-
-impl Default for BlockSize {
-    fn default() -> Self {
-        BlockSize::Max64KB
-    }
+    /// 8MB block size.
+    Max8MB = 8,
 }
 
 impl BlockSize {
-    pub fn get_size(&self) -> usize {
+    /// Try to find optimal size based on passed buffer length.
+    pub(crate) fn from_buf_length(buf_len: usize) -> Self {
+        let mut blocksize = BlockSize::Max4MB;
+
+        for candidate in [BlockSize::Max256KB, BlockSize::Max64KB] {
+            if buf_len > candidate.get_size() {
+                return blocksize;
+            }
+            blocksize = candidate;
+        }
+        BlockSize::Max64KB
+    }
+    pub(crate) fn get_size(&self) -> usize {
         match self {
+            BlockSize::Auto => unreachable!(),
             BlockSize::Max64KB => 64 * 1024,
             BlockSize::Max256KB => 256 * 1024,
             BlockSize::Max1MB => 1024 * 1024,
             BlockSize::Max4MB => 4 * 1024 * 1024,
+            BlockSize::Max8MB => 8 * 1024 * 1024,
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
+/// The two `BlockMode` operations that can be set on (`FrameInfo`)[FrameInfo]
+#[derive(Default)]
 pub enum BlockMode {
     /// Every block is compressed independently. The default.
+    #[default]
     Independent,
     /// Blocks can reference data from previous blocks.
     ///
@@ -68,50 +90,43 @@ pub enum BlockMode {
     Linked,
 }
 
-impl Default for BlockMode {
-    fn default() -> Self {
-        BlockMode::Independent
-    }
-}
-
-/*
-From: https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
-
-General Structure of LZ4 Frame format
--------------------------------------
-
-| MagicNb | F. Descriptor | Block | (...) | EndMark | C. Checksum |
-|:-------:|:-------------:| ----- | ----- | ------- | ----------- |
-| 4 bytes |  3-15 bytes   |       |       | 4 bytes | 0-4 bytes   |
-
-Frame Descriptor
-----------------
-
-| FLG     | BD      | (Content Size) | (Dictionary ID) | HC      |
-| ------- | ------- |:--------------:|:---------------:| ------- |
-| 1 byte  | 1 byte  |  0 - 8 bytes   |   0 - 4 bytes   | 1 byte  |
-
-__FLG byte__
-
-|  BitNb  |  7-6  |   5   |    4     |  3   |    2     |    1     |   0  |
-| ------- |-------|-------|----------|------|----------|----------|------|
-|FieldName|Version|B.Indep|B.Checksum|C.Size|C.Checksum|*Reserved*|DictID|
-
-__BD byte__
-
-|  BitNb  |     7    |     6-5-4     |  3-2-1-0 |
-| ------- | -------- | ------------- | -------- |
-|FieldName|*Reserved*| Block MaxSize |*Reserved*|
-
-Data Blocks
------------
-
-| Block Size |  data  | (Block Checksum) |
-|:----------:| ------ |:----------------:|
-|  4 bytes   |        |   0 - 4 bytes    |
-
-*/
-#[derive(Debug, Clone)]
+// From: https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
+//
+// General Structure of LZ4 Frame format
+// -------------------------------------
+//
+// | MagicNb | F. Descriptor | Block | (...) | EndMark | C. Checksum |
+// |:-------:|:-------------:| ----- | ----- | ------- | ----------- |
+// | 4 bytes |  3-15 bytes   |       |       | 4 bytes | 0-4 bytes   |
+//
+// Frame Descriptor
+// ----------------
+//
+// | FLG     | BD      | (Content Size) | (Dictionary ID) | HC      |
+// | ------- | ------- |:--------------:|:---------------:| ------- |
+// | 1 byte  | 1 byte  |  0 - 8 bytes   |   0 - 4 bytes   | 1 byte  |
+//
+// __FLG byte__
+//
+// |  BitNb  |  7-6  |   5   |    4     |  3   |    2     |    1     |   0  |
+// | ------- |-------|-------|----------|------|----------|----------|------|
+// |FieldName|Version|B.Indep|B.Checksum|C.Size|C.Checksum|*Reserved*|DictID|
+//
+// __BD byte__
+//
+// |  BitNb  |     7    |     6-5-4     |  3-2-1-0 |
+// | ------- | -------- | ------------- | -------- |
+// |FieldName|*Reserved*| Block MaxSize |*Reserved*|
+//
+// Data Blocks
+// -----------
+//
+// | Block Size |  data  | (Block Checksum) |
+// |:----------:| ------ |:----------------:|
+// |  4 bytes   |        |   0 - 4 bytes    |
+//
+#[derive(Debug, Default, Clone)]
+/// The metadata for de/compressing with lz4 frame format.
 pub struct FrameInfo {
     /// If set, includes the total uncompressed size of data in the frame.
     pub content_size: Option<u64>,
@@ -126,34 +141,66 @@ pub struct FrameInfo {
     pub block_mode: BlockMode,
     /// If set, includes a checksum for each data block in the frame.
     pub block_checksums: bool,
-    /// If set, includes a content checksum to verify that the full frame contents have been decoded correctly.
+    /// If set, includes a content checksum to verify that the full frame contents have been
+    /// decoded correctly.
     pub content_checksum: bool,
-}
-
-impl Default for FrameInfo {
-    fn default() -> Self {
-        FrameInfo::new()
-    }
+    /// If set, use the legacy frame format
+    pub legacy_frame: bool,
 }
 
 impl FrameInfo {
+    /// Create a new `FrameInfo`.
     pub fn new() -> Self {
-        Self {
-            content_size: None,
-            dict_id: None,
-            block_size: BlockSize::default(),
-            block_mode: BlockMode::default(),
-            block_checksums: false,
-            content_checksum: false,
-        }
+        Self::default()
     }
+
+    /// Whether to include the total uncompressed size of data in the frame.
+    pub fn content_size(mut self, content_size: Option<u64>) -> Self {
+        self.content_size = content_size;
+        self
+    }
+
+    /// The maximum uncompressed size of each data block.
+    pub fn block_size(mut self, block_size: BlockSize) -> Self {
+        self.block_size = block_size;
+        self
+    }
+
+    /// The block mode.
+    pub fn block_mode(mut self, block_mode: BlockMode) -> Self {
+        self.block_mode = block_mode;
+        self
+    }
+
+    /// If set, includes a checksum for each data block in the frame.
+    pub fn block_checksums(mut self, block_checksums: bool) -> Self {
+        self.block_checksums = block_checksums;
+        self
+    }
+
+    /// If set, includes a content checksum to verify that the full frame contents have been
+    /// decoded correctly.
+    pub fn content_checksum(mut self, content_checksum: bool) -> Self {
+        self.content_checksum = content_checksum;
+        self
+    }
+
+    /// If set, use the legacy frame format.
+    pub fn legacy_frame(mut self, legacy_frame: bool) -> Self {
+        self.legacy_frame = legacy_frame;
+        self
+    }
+
     pub(crate) fn read_size(input: &[u8]) -> Result<usize, Error> {
         let mut required = MIN_FRAME_INFO_SIZE;
+        let magic_num = u32::from_le_bytes(input[0..4].try_into().unwrap());
+        if magic_num == LZ4F_LEGACY_MAGIC_NUMBER {
+            return Ok(MAGIC_NUMBER_SIZE);
+        }
+
         if input.len() < required {
             return Ok(required);
         }
-
-        let magic_num = u32::from_le_bytes(input[0..4].try_into().unwrap());
 
         if LZ4F_SKIPPABLE_MAGIC_RANGE.contains(&magic_num) {
             return Ok(8);
@@ -235,6 +282,13 @@ impl FrameInfo {
             input.read_exact(&mut buffer)?;
             u32::from_le_bytes(buffer)
         };
+        if magic_num == LZ4F_LEGACY_MAGIC_NUMBER {
+            return Ok(FrameInfo {
+                block_size: BlockSize::Max8MB,
+                legacy_frame: true,
+                ..FrameInfo::default()
+            });
+        }
         if LZ4F_SKIPPABLE_MAGIC_RANGE.contains(&magic_num) {
             let mut buffer = [0u8; 4];
             input.read_exact(&mut buffer)?;
@@ -313,6 +367,7 @@ impl FrameInfo {
             block_mode,
             block_checksums,
             content_checksum,
+            legacy_frame: false,
         })
     }
 }

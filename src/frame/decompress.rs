@@ -1,12 +1,15 @@
 use std::{
     fmt,
     hash::Hasher,
-    io::{self, BufRead},
+    io::{self, BufRead, ErrorKind},
     mem::size_of,
 };
 use twox_hash::XxHash32;
 
-use super::header::{BlockInfo, BlockMode, FrameInfo, MAX_FRAME_INFO_SIZE, MIN_FRAME_INFO_SIZE};
+use super::header::{
+    BlockInfo, BlockMode, FrameInfo, LZ4F_LEGACY_MAGIC_NUMBER, MAGIC_NUMBER_SIZE,
+    MAX_FRAME_INFO_SIZE, MIN_FRAME_INFO_SIZE,
+};
 use super::Error;
 use crate::{
     block::WINDOW_SIZE,
@@ -85,10 +88,6 @@ impl<R: io::Read> FrameDecoder<R> {
         }
     }
 
-    pub fn frame_info(&mut self) -> Option<&FrameInfo> {
-        self.current_frame_info.as_ref()
-    }
-
     /// Gets a reference to the underlying reader in this decoder.
     pub fn get_ref(&self) -> &R {
         &self.r
@@ -102,18 +101,40 @@ impl<R: io::Read> FrameDecoder<R> {
         &mut self.r
     }
 
+    /// Consumes the FrameDecoder and returns the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.r
+    }
+
     fn read_frame_info(&mut self) -> Result<usize, io::Error> {
         let mut buffer = [0u8; MAX_FRAME_INFO_SIZE];
-        match self.r.read(&mut buffer[..MIN_FRAME_INFO_SIZE])? {
+
+        match self.r.read(&mut buffer[..MAGIC_NUMBER_SIZE])? {
             0 => return Ok(0),
-            MIN_FRAME_INFO_SIZE => (),
-            read => self.r.read_exact(&mut buffer[read..MIN_FRAME_INFO_SIZE])?,
+            MAGIC_NUMBER_SIZE => (),
+            read => self.r.read_exact(&mut buffer[read..MAGIC_NUMBER_SIZE])?,
+        }
+
+        if u32::from_le_bytes(buffer[0..MAGIC_NUMBER_SIZE].try_into().unwrap())
+            != LZ4F_LEGACY_MAGIC_NUMBER
+        {
+            match self
+                .r
+                .read(&mut buffer[MAGIC_NUMBER_SIZE..MIN_FRAME_INFO_SIZE])?
+            {
+                0 => return Ok(0),
+                MIN_FRAME_INFO_SIZE => (),
+                read => self
+                    .r
+                    .read_exact(&mut buffer[MAGIC_NUMBER_SIZE + read..MIN_FRAME_INFO_SIZE])?,
+            }
         }
         let required = FrameInfo::read_size(&buffer[..MIN_FRAME_INFO_SIZE])?;
-        if required != MIN_FRAME_INFO_SIZE {
+        if required != MIN_FRAME_INFO_SIZE && required != MAGIC_NUMBER_SIZE {
             self.r
                 .read_exact(&mut buffer[MIN_FRAME_INFO_SIZE..required])?;
         }
+
         let frame_info = FrameInfo::read(&buffer[..required])?;
         if frame_info.dict_id.is_some() {
             // Unsupported right now so it must be None
@@ -190,7 +211,8 @@ impl<R: io::Read> FrameDecoder<R> {
             } else if self.dst_start + self.ext_dict_len > WINDOW_SIZE {
                 // There's more than WINDOW_SIZE bytes of lookback adding the prefix and ext_dict.
                 // Since we have a limited buffer we must shrink ext_dict in favor of the prefix,
-                // so that we can fit up to max_block_size bytes between dst_start and ext_dict start.
+                // so that we can fit up to max_block_size bytes between dst_start and ext_dict
+                // start.
                 let delta = self
                     .ext_dict_len
                     .min(self.dst_start + self.ext_dict_len - WINDOW_SIZE);
@@ -208,7 +230,13 @@ impl<R: io::Read> FrameDecoder<R> {
         // Read and decompress block
         let block_info = {
             let mut buffer = [0u8; 4];
-            self.r.read_exact(&mut buffer)?;
+            if let Err(err) = self.r.read_exact(&mut buffer) {
+                if err.kind() == ErrorKind::UnexpectedEof {
+                    return Ok(0);
+                } else {
+                    return Err(err);
+                }
+            }
             BlockInfo::read(&buffer)?
         };
         match block_info {
@@ -257,7 +285,7 @@ impl<R: io::Read> FrameDecoder<R> {
                     let ext_dict = &tail[..self.ext_dict_len];
 
                     debug_assert!(head.len() - self.dst_start >= max_block_size);
-                    crate::block::decompress::decompress_internal::<_, true>(
+                    crate::block::decompress::decompress_internal::<true, _>(
                         &self.src[..len],
                         &mut SliceSink::new(head, self.dst_start),
                         ext_dict,
@@ -265,7 +293,7 @@ impl<R: io::Read> FrameDecoder<R> {
                 } else {
                     // Independent blocks OR linked blocks with only prefix data
                     debug_assert!(self.dst.capacity() - self.dst_start >= max_block_size);
-                    crate::block::decompress::decompress_internal::<_, false>(
+                    crate::block::decompress::decompress_internal::<false, _>(
                         &self.src[..len],
                         &mut vec_sink_for_decompression(
                             &mut self.dst,
@@ -342,7 +370,7 @@ impl<R: io::Read> io::Read for FrameDecoder<R> {
         let mut written = 0;
         loop {
             match self.fill_buf() {
-                Ok(b) if b.is_empty() => return Ok(written),
+                Ok([]) => return Ok(written),
                 Ok(b) => {
                     let s = std::str::from_utf8(b).map_err(|_| {
                         io::Error::new(
@@ -365,7 +393,7 @@ impl<R: io::Read> io::Read for FrameDecoder<R> {
         let mut written = 0;
         loop {
             match self.fill_buf() {
-                Ok(b) if b.is_empty() => return Ok(written),
+                Ok([]) => return Ok(written),
                 Ok(b) => {
                     buf.extend_from_slice(b);
                     let len = b.len();
@@ -411,7 +439,6 @@ impl<R: fmt::Debug + io::Read> fmt::Debug for FrameDecoder<R> {
 }
 
 /// Similar to `v.get_mut(start..end) but will adjust the len if needed.
-/// Panics if there's not enough capacity.
 #[inline]
 fn vec_resize_and_get_mut(v: &mut Vec<u8>, start: usize, end: usize) -> &mut [u8] {
     if end > v.len() {

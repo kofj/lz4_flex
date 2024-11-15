@@ -3,12 +3,17 @@
 #[macro_use]
 extern crate more_asserts;
 
+use std::iter;
+
 use lz4_compress::compress as lz4_rust_compress;
 #[cfg(feature = "frame")]
 use lz4_flex::frame::BlockMode;
 use lz4_flex::{
-    block::{compress_prepend_size, decompress_size_prepended},
-    compress, decompress,
+    block::{
+        compress_prepend_size, decompress, decompress_size_prepended,
+        decompress_size_prepended_with_dict,
+    },
+    compress as compress_block,
 };
 
 const COMPRESSION1K: &[u8] = include_bytes!("../benches/compression_1k.txt");
@@ -70,10 +75,10 @@ pub fn lz4_flex_frame_decompress(input: &[u8]) -> Result<Vec<u8>, lz4_flex::fram
 }
 
 /// Test that the compressed string decompresses to the original string.
-fn inverse(bytes: impl AsRef<[u8]>) {
+fn test_roundtrip(bytes: impl AsRef<[u8]>) {
     let bytes = bytes.as_ref();
     // compress with rust, decompress with rust
-    let compressed_flex = compress(bytes);
+    let compressed_flex = compress_block(bytes);
     let decompressed = decompress(&compressed_flex, bytes.len()).unwrap();
     assert_eq!(decompressed, bytes);
 
@@ -112,7 +117,7 @@ fn lz4_cpp_compatibility(bytes: &[u8]) {
     }
 
     // compress with rust, decompress with lz4 cpp
-    let compressed_flex = compress(bytes);
+    let compressed_flex = compress_block(bytes);
     let decompressed = lz4_cpp_block_decompress(&compressed_flex, bytes.len()).unwrap();
     assert_eq!(decompressed, bytes);
 
@@ -128,16 +133,15 @@ fn lz4_cpp_compatibility(bytes: &[u8]) {
         assert_eq!(decompressed, bytes);
 
         // compress with rust, decompress with lz4 cpp
-        if !bytes.is_empty() {
-            // compress_frame won't write a header if nothing is written to it
-            // which is more in line with io::Write interface?
-            for bm in &[BlockMode::Independent, BlockMode::Linked] {
-                let mut frame_info = lz4_flex::frame::FrameInfo::new();
-                frame_info.block_mode = *bm;
-                let compressed_flex = lz4_flex_frame_compress_with(frame_info, bytes).unwrap();
-                let decompressed = lz4_cpp_frame_decompress(&compressed_flex).unwrap();
-                assert_eq!(decompressed, bytes);
-            }
+        //if !bytes.is_empty() {
+        // compress_frame won't write a header if nothing is written to it
+        // which is more in line with io::Write interface?
+        for bm in &[BlockMode::Independent, BlockMode::Linked] {
+            let mut frame_info = lz4_flex::frame::FrameInfo::new();
+            frame_info.block_mode = *bm;
+            let compressed_flex = lz4_flex_frame_compress_with(frame_info, bytes).unwrap();
+            let decompressed = lz4_cpp_frame_decompress(&compressed_flex).unwrap();
+            assert_eq!(decompressed, bytes);
         }
     }
 }
@@ -152,10 +156,39 @@ fn compare_compression() {
 }
 
 #[test]
-fn test_minimum_compression_ratio() {
-    let compressed = compress(COMPRESSION34K);
+fn test_minimum_compression_ratio_block() {
+    let compressed = compress_block(COMPRESSION34K);
     let ratio = compressed.len() as f64 / COMPRESSION34K.len() as f64;
-    assert_lt!(ratio, 0.585); // TODO check why compression is not deterministic (fails in ci for 0.58)
+    assert_lt!(ratio, 0.585); // TODO check why compression is not deterministic (fails in ci for
+                              // 0.58)
+    let compressed = compress_block(COMPRESSION65);
+    let ratio = compressed.len() as f64 / COMPRESSION65.len() as f64;
+    assert_lt!(ratio, 0.574);
+
+    let compressed = compress_block(COMPRESSION66JSON);
+    let ratio = compressed.len() as f64 / COMPRESSION66JSON.len() as f64;
+    assert_lt!(ratio, 0.229);
+}
+
+#[cfg(feature = "frame")]
+#[test]
+fn test_minimum_compression_ratio_frame() {
+    use lz4_flex::frame::FrameInfo;
+
+    let get_ratio = |input| {
+        let compressed = lz4_flex_frame_compress_with(FrameInfo::new(), input).unwrap();
+
+        compressed.len() as f64 / input.len() as f64
+    };
+
+    let ratio = get_ratio(COMPRESSION34K);
+    assert_lt!(ratio, 0.585);
+
+    let ratio = get_ratio(COMPRESSION65);
+    assert_lt!(ratio, 0.574);
+
+    let ratio = get_ratio(COMPRESSION66JSON);
+    assert_lt!(ratio, 0.235);
 }
 
 use lz_fear::raw::compress2;
@@ -173,10 +206,12 @@ fn compress_lz4_fear(input: &[u8]) -> Vec<u8> {
 }
 
 fn print_compression_ration(input: &'static [u8], name: &str) {
-    let compressed = compress(input);
+    println!("\nComparing for {name}");
+    let name = "";
+    let compressed = compress_block(input);
     // println!("{:?}", compressed);
     println!(
-        "lz4_flex Compression Ratio {:?} {:?}",
+        "lz4_flex block Compression Ratio {:?} {:?}",
         name,
         compressed.len() as f64 / input.len() as f64
     );
@@ -186,7 +221,7 @@ fn print_compression_ration(input: &'static [u8], name: &str) {
     let compressed = lz4_cpp_block_compress(input).unwrap();
     // println!("{:?}", compressed);
     println!(
-        "Lz4 Cpp Compression Ratio {:?} {:?}",
+        "Lz4 Cpp block Compression Ratio {:?} {:?}",
         name,
         compressed.len() as f64 / input.len() as f64
     );
@@ -195,7 +230,7 @@ fn print_compression_ration(input: &'static [u8], name: &str) {
     assert_eq!(decompressed, input);
     let compressed = lz4_rust_compress(input);
     println!(
-        "lz4_rust_compress Compression Ratio {:?} {:?}",
+        "lz4_rust_compress block Compression Ratio {:?} {:?}",
         name,
         compressed.len() as f64 / input.len() as f64
     );
@@ -203,7 +238,7 @@ fn print_compression_ration(input: &'static [u8], name: &str) {
     assert_eq!(decompressed, input);
     let compressed = compress_lz4_fear(input);
     println!(
-        "lz4_fear_compress Compression Ratio {:?} {:?}",
+        "lz4_fear_compress block Compression Ratio {:?} {:?}",
         name,
         compressed.len() as f64 / input.len() as f64
     );
@@ -214,14 +249,50 @@ fn print_compression_ration(input: &'static [u8], name: &str) {
         name,
         compressed.len() as f64 / input.len() as f64
     );
+
+    #[cfg(feature = "frame")]
+    {
+        let mut frame_info = lz4_flex::frame::FrameInfo::new();
+        frame_info.block_mode = BlockMode::Independent;
+        //frame_info.block_size = lz4_flex::frame::BlockSize::Max4MB;
+        let compressed = lz4_flex_frame_compress_with(frame_info, input).unwrap();
+        println!(
+            "lz4_flex frame indep Compression Ratio {:?} {:?}",
+            name,
+            compressed.len() as f64 / input.len() as f64
+        );
+
+        let mut frame_info = lz4_flex::frame::FrameInfo::new();
+        frame_info.block_mode = BlockMode::Linked;
+        let compressed = lz4_flex_frame_compress_with(frame_info, input).unwrap();
+        println!(
+            "lz4_flex frame linked Compression Ratio {:?} {:?}",
+            name,
+            compressed.len() as f64 / input.len() as f64
+        );
+
+        let compressed = lz4_cpp_frame_compress(input, true).unwrap();
+        println!(
+            "lz4 cpp frame indep Compression Ratio {:?} {:?}",
+            name,
+            compressed.len() as f64 / input.len() as f64
+        );
+
+        let compressed = lz4_cpp_frame_compress(input, false).unwrap();
+        println!(
+            "lz4 cpp frame linked Compression Ratio {:?} {:?}",
+            name,
+            compressed.len() as f64 / input.len() as f64
+        );
+    }
 }
 
 // #[test]
 // fn test_ratio() {
 //     const COMPRESSION66K: &'static [u8] = include_bytes!("../benches/compression_65k.txt");
 //     let compressed = compress(COMPRESSION66K);
-//     println!("Compression Ratio 66K {:?}", compressed.len() as f64/ COMPRESSION66K.len()  as f64);
-//     let _decompressed = decompress(&compressed).unwrap();
+//     println!("Compression Ratio 66K {:?}", compressed.len() as f64/ COMPRESSION66K.len()  as
+// f64);     let _decompressed = decompress(&compressed).unwrap();
 
 //     let mut vec = Vec::with_capacity(10 + (COMPRESSION66K.len() as f64 * 1.1) as usize);
 //     let input = COMPRESSION66K;
@@ -251,103 +322,111 @@ fn print_compression_ration(input: &'static [u8], name: &str) {
 mod checked_decode {
     use super::*;
 
-    #[cfg_attr(not(feature = "checked_decode"), ignore)]
     #[test]
     fn error_case_1() {
         let _err = decompress_size_prepended(&[122, 1, 0, 1, 0, 10, 1, 0]);
     }
-    #[cfg_attr(not(feature = "checked_decode"), ignore)]
     #[test]
     fn error_case_2() {
         let _err = decompress_size_prepended(&[
             44, 251, 49, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0,
         ]);
     }
-    #[cfg_attr(not(feature = "checked_decode"), ignore)]
     #[test]
     fn error_case_3() {
         let _err = decompress_size_prepended(&[
             7, 0, 0, 0, 0, 0, 0, 11, 0, 0, 7, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0,
         ]);
     }
+
+    #[test]
+    fn error_case_4() {
+        let _err = decompress_size_prepended(&[0, 61, 0, 0, 0, 7, 0]);
+    }
+
+    #[test]
+    fn error_case_5() {
+        let _err = decompress_size_prepended(&[8, 0, 0, 0, 4, 0, 0, 0]);
+    }
 }
 
 #[test]
 fn test_end_offset() {
-    // the last 5 bytes need to be literals, so the last match block is not allowed to match to the end
-    inverse("AAAAAAAAAAAAAAAAAAAAAAAAaAAAAAAAAAAAAAAAAAAAAAAAA");
-    inverse("AAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBaAAAAAAAAAAAAAAAAAAAAAAAA");
+    // the last 5 bytes need to be literals, so the last match block is not allowed to match to the
+    // end
+    test_roundtrip("AAAAAAAAAAAAAAAAAAAAAAAAaAAAAAAAAAAAAAAAAAAAAAAAA");
+    test_roundtrip("AAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBaAAAAAAAAAAAAAAAAAAAAAAAA");
 }
 #[test]
 fn small_compressible_1() {
-    inverse("AAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBaAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBa");
+    test_roundtrip("AAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBaAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBa");
 }
 #[test]
 fn small_compressible_2() {
-    inverse("AAAAAAAAAAAZZZZZZZZAAAAAAAA");
+    test_roundtrip("AAAAAAAAAAAZZZZZZZZAAAAAAAA");
 }
 
 #[test]
 fn small_compressible_3() {
-    inverse("AAAAAAAAAAAZZZZZZZZAAAAAAAA");
+    test_roundtrip("AAAAAAAAAAAZZZZZZZZAAAAAAAA");
 }
 
 #[test]
 fn shakespear1() {
-    inverse("to live or not to live");
+    test_roundtrip("to live or not to live");
 }
 #[test]
 fn shakespear2() {
-    inverse("Love is a wonderful terrible thing");
+    test_roundtrip("Love is a wonderful terrible thing");
 }
 #[test]
 fn shakespear3() {
-    inverse("There is nothing either good or bad, but thinking makes it so.");
+    test_roundtrip("There is nothing either good or bad, but thinking makes it so.");
 }
 #[test]
 fn shakespear4() {
-    inverse("I burn, I pine, I perish.");
+    test_roundtrip("I burn, I pine, I perish.");
 }
 
 #[test]
 fn text_text() {
-    inverse("Save water, it doesn't grow on trees.");
-    inverse("The panda bear has an amazing black-and-white fur.");
-    inverse("The average panda eats as much as 9 to 14 kg of bamboo shoots a day.");
-    inverse("You are 60% water. Save 60% of yourself!");
-    inverse("To cute to die! Save the red panda!");
+    test_roundtrip("Save water, it doesn't grow on trees.");
+    test_roundtrip("The panda bear has an amazing black-and-white fur.");
+    test_roundtrip("The average panda eats as much as 9 to 14 kg of bamboo shoots a day.");
+    test_roundtrip("You are 60% water. Save 60% of yourself!");
+    test_roundtrip("To cute to die! Save the red panda!");
 }
 
 #[test]
 fn not_compressible() {
-    inverse("as6yhol.;jrew5tyuikbfewedfyjltre22459ba");
-    inverse("jhflkdjshaf9p8u89ybkvjsdbfkhvg4ut08yfrr");
+    test_roundtrip("as6yhol.;jrew5tyuikbfewedfyjltre22459ba");
+    test_roundtrip("jhflkdjshaf9p8u89ybkvjsdbfkhvg4ut08yfrr");
 }
 #[test]
 fn short_1() {
-    inverse("ahhd");
-    inverse("ahd");
-    inverse("x-29");
-    inverse("x");
-    inverse("k");
-    inverse(".");
-    inverse("ajsdh");
-    inverse("aaaaaa");
+    test_roundtrip("ahhd");
+    test_roundtrip("ahd");
+    test_roundtrip("x-29");
+    test_roundtrip("x");
+    test_roundtrip("k");
+    test_roundtrip(".");
+    test_roundtrip("ajsdh");
+    test_roundtrip("aaaaaa");
 }
 
 #[test]
 fn short_2() {
-    inverse("aaaaaabcbcbcbc");
+    test_roundtrip("aaaaaabcbcbcbc");
 }
 
 #[test]
 fn empty_string() {
-    inverse("");
+    test_roundtrip("");
 }
 
 #[test]
 fn nulls() {
-    inverse("\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    test_roundtrip("\0\0\0\0\0\0\0\0\0\0\0\0\0");
 }
 
 #[test]
@@ -364,7 +443,7 @@ fn bug_fuzz() {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 46, 0, 0, 8, 0, 138,
     ];
-    inverse(data);
+    test_roundtrip(data);
 }
 #[test]
 fn bug_fuzz_2() {
@@ -374,7 +453,7 @@ fn bug_fuzz_2() {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 65, 0, 0, 128, 10, 1, 10, 1, 0, 122,
     ];
-    inverse(data);
+    test_roundtrip(data);
 }
 #[test]
 fn bug_fuzz_3() {
@@ -387,12 +466,12 @@ fn bug_fuzz_3() {
         15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 61, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 0,
         48, 45, 0, 1, 0, 0, 1, 0,
     ];
-    inverse(data);
+    test_roundtrip(data);
 }
 #[test]
 fn bug_fuzz_4() {
     let data = &[147];
-    inverse(data);
+    test_roundtrip(data);
 }
 #[test]
 fn buf_fuzz_5() {
@@ -401,7 +480,55 @@ fn buf_fuzz_5() {
         255, 255, 255, 253, 235, 156, 140, 8, 61, 255, 255, 255, 255, 65, 239, 254,
     ];
 
-    inverse(data);
+    test_roundtrip(data);
+}
+
+#[test]
+fn bug_fuzz_6() {
+    let data = &[
+        181, 181, 181, 181, 181, 147, 147, 147, 0, 0, 255, 218, 44, 0, 177, 44, 0, 233, 177, 74,
+        85, 47, 95, 146, 189, 177, 1, 0, 255, 2, 109, 180, 255, 255, 0, 0, 0, 181, 181, 181, 147,
+        147, 147, 0, 0, 255, 218, 146, 146, 181, 0, 0, 181,
+    ];
+
+    test_roundtrip(data);
+}
+
+fn test_decomp(data: &[u8]) {
+    let size = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    if size > 20_000_000 {
+        return;
+    }
+    // should not panic
+    let _ = decompress_size_prepended(data);
+    let _ = decompress_size_prepended_with_dict(data, data);
+}
+
+#[test]
+fn bug_fuzz_7() {
+    let data = &[
+        39, 0, 0, 0, 0, 0, 0, 237, 0, 0, 0, 0, 0, 0, 16, 0, 0, 4, 0, 0, 0, 39, 32, 0, 2, 0, 162, 5,
+        36, 0, 0, 0, 0, 7, 0,
+    ];
+
+    test_decomp(data);
+}
+
+// TODO maybe also not panic for default feature flags
+#[cfg(not(feature = "safe-decode"))]
+#[test]
+fn bug_fuzz_8() {
+    let data = &[
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 10,
+    ];
+
+    test_decomp(data);
+}
+
+#[test]
+fn test_so_many_zeros() {
+    let data: Vec<u8> = iter::repeat(0).take(30_000).collect();
+    test_roundtrip(data);
 }
 
 #[test]
@@ -411,15 +538,16 @@ fn compression_works() {
         When implementing an ExactSizeIterator, you must also implement Iterator. When doing so, the implementation of size_hint must return the exact size of the iterator.
         The len method has a default implementation, so you usually shouldn't implement it. However, you may be able to provide a more performant implementation than the default, so overriding it in this case makes sense."#;
 
-    inverse(s);
-    assert!(compress(s.as_bytes()).len() < s.len());
+    test_roundtrip(s);
+    assert!(compress_block(s.as_bytes()).len() < s.len());
 }
 
 // #[test]
 // fn multi_compress() {
-//     let s1 = r#"An iterator that knows its exact length.performant implementation than the default, so overriding it in this case makes sense."#;
-//     let s2 = r#"An iterator that knows its exact length.performant implementation than the default, so overriding it in this case makes sense."#;
-//     let mut out = vec![];
+//     let s1 = r#"An iterator that knows its exact length.performant implementation than the
+// default, so overriding it in this case makes sense."#;     let s2 = r#"An iterator that knows its
+// exact length.performant implementation than the default, so overriding it in this case makes
+// sense."#;     let mut out = vec![];
 //     compress_into()
 //     inverse(s);
 //     assert!(compress(s.as_bytes()).len() < s.len());
@@ -428,36 +556,70 @@ fn compression_works() {
 #[ignore]
 #[test]
 fn big_compression() {
-    let mut s = Vec::with_capacity(80_000000);
+    let mut s = Vec::with_capacity(80_000_000);
 
-    for n in 0..80_000000 {
+    for n in 0..80_000_000 {
         s.push((n as u8).wrapping_mul(0xA).wrapping_add(33) ^ 0xA2);
     }
 
-    inverse(s);
+    test_roundtrip(s);
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn test_text_10mb() {
-    inverse(COMPRESSION10MB);
+    test_roundtrip(COMPRESSION10MB);
 }
 #[test]
 fn test_json_66k() {
-    inverse(COMPRESSION66JSON);
+    test_roundtrip(COMPRESSION66JSON);
 }
 #[test]
 fn test_text_65k() {
-    inverse(COMPRESSION65);
+    test_roundtrip(COMPRESSION65);
 }
 #[test]
 fn test_text_34k() {
-    inverse(COMPRESSION34K);
+    test_roundtrip(COMPRESSION34K);
 }
 
 #[test]
 fn test_text_1k() {
-    inverse(COMPRESSION1K);
+    test_roundtrip(COMPRESSION1K);
+}
+
+use proptest::{prelude::*, test_runner::FileFailurePersistence};
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("regressions"))),
+        ..Default::default()
+    })]
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn proptest_roundtrip(v in vec_of_vec()) {
+        let data: Vec<u8>  = v.iter().flat_map(|v|v.iter()).cloned().collect::<Vec<_>>();
+        test_roundtrip(data);  // sum of the sum of all vectors.
+    }
+
+}
+
+fn vec_of_vec() -> impl Strategy<Value = Vec<Vec<u8>>> {
+    const N: u8 = 200;
+
+    let length = 0..N;
+    length.prop_flat_map(vec_from_length)
+}
+
+fn vec_from_length(length: u8) -> impl Strategy<Value = Vec<Vec<u8>>> {
+    const K: usize = u8::MAX as usize;
+    let mut result = vec![];
+    for index in 1..length {
+        let inner = proptest::collection::vec(0..index, 0..K);
+        result.push(inner);
+    }
+    result
 }
 
 #[cfg(feature = "frame")]
@@ -494,7 +656,8 @@ mod frame {
             // roundtrip
             let uncompressed = lz4_flex_frame_decompress(&compressed).unwrap();
             assert_eq!(uncompressed, input);
-            // corrupt last block checksum, which is at 8th to 4th last bytes of the compressed output
+            // corrupt last block checksum, which is at 8th to 4th last bytes of the compressed
+            // output
             let compressed_len = compressed.len();
             compressed[compressed_len - 5] ^= 0xFF;
             match lz4_flex_frame_decompress(&compressed) {
@@ -521,6 +684,7 @@ mod frame {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn block_size() {
         let mut last_compressed_len = usize::MAX;
         for block_size in &[
@@ -548,8 +712,7 @@ mod frame {
     fn content_size() {
         let mut frame_info = lz4_flex::frame::FrameInfo::new();
         frame_info.content_size = Some(COMPRESSION1K.len() as u64);
-        let mut compressed =
-            lz4_flex_frame_compress_with(frame_info, COMPRESSION1K).unwrap();
+        let mut compressed = lz4_flex_frame_compress_with(frame_info, COMPRESSION1K).unwrap();
 
         // roundtrip
         let uncompressed = lz4_flex_frame_decompress(&compressed).unwrap();
@@ -560,8 +723,7 @@ mod frame {
             // We'll generate a valid FrameInfo and copy it to the test data
             let mut frame_info = lz4_flex::frame::FrameInfo::new();
             frame_info.content_size = Some(3);
-            let dummy_compressed =
-                lz4_flex_frame_compress_with(frame_info, b"123").unwrap();
+            let dummy_compressed = lz4_flex_frame_compress_with(frame_info, b"123").unwrap();
             // `15` (7 + 8) is the size of the header plus the content size in the compressed bytes
             compressed[..15].copy_from_slice(&dummy_compressed[..15]);
         }
@@ -572,6 +734,14 @@ mod frame {
             }
             r => panic!("{:?}", r),
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn legacy_frame() {
+        const DECOMPRESSION10MB_LEGACY: &[u8] = include_bytes!("../benches/dickens.lz4");
+        let uncompressed = lz4_flex_frame_decompress(DECOMPRESSION10MB_LEGACY).unwrap();
+        assert_eq!(uncompressed, COMPRESSION10MB);
     }
 }
 
@@ -594,12 +764,12 @@ mod test_compression {
         print_ratio(
             "Ratio 1k flex",
             COMPRESSION1K.len(),
-            compress(COMPRESSION1K).len(),
+            compress_block(COMPRESSION1K).len(),
         );
         print_ratio(
             "Ratio 34k flex",
             COMPRESSION34K.len(),
-            compress(COMPRESSION34K).len(),
+            compress_block(COMPRESSION34K).len(),
         );
     }
 

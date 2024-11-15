@@ -1,23 +1,21 @@
-/*!
-LZ4 Frame Format
-
-As defined in <https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md>
-
-# Example: compress data on `stdin` with frame format
-This program reads data from `stdin`, compresses it and emits it to `stdout`.
-This example can be found in `examples/compress.rs`:
-```no_run
-use std::io;
-let stdin = io::stdin();
-let stdout = io::stdout();
-let mut rdr = stdin.lock();
-// Wrap the stdout writer in a LZ4 Frame writer.
-let mut wtr = lz4_flex::frame::FrameEncoder::new(stdout.lock());
-io::copy(&mut rdr, &mut wtr).expect("I/O operation failed");
-wtr.finish().unwrap();
-```
-
-*/
+//! LZ4 Frame Format
+//!
+//! As defined in <https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md>
+//!
+//! # Example: compress data on `stdin` with frame format
+//! This program reads data from `stdin`, compresses it and emits it to `stdout`.
+//! This example can be found in `examples/compress.rs`:
+//! ```no_run
+//! use std::io;
+//! let stdin = io::stdin();
+//! let stdout = io::stdout();
+//! let mut rdr = stdin.lock();
+//! // Wrap the stdout writer in a LZ4 Frame writer.
+//! let mut wtr = lz4_flex::frame::FrameEncoder::new(stdout.lock());
+//! io::copy(&mut rdr, &mut wtr).expect("I/O operation failed");
+//! wtr.finish().unwrap();
+//! ```
+//!
 
 use std::{fmt, io};
 
@@ -27,12 +25,13 @@ pub(crate) mod compress;
 pub(crate) mod decompress;
 pub(crate) mod header;
 
-pub use compress::FrameEncoder;
+pub use compress::{AutoFinishEncoder, FrameEncoder};
 pub use decompress::FrameDecoder;
 pub use header::{BlockMode, BlockSize, FrameInfo};
 
 #[derive(Debug)]
 #[non_exhaustive]
+/// Errors that can occur when de/compressing lz4.
 pub enum Error {
     /// Compression error.
     CompressionError(crate::block::CompressError),
@@ -64,7 +63,12 @@ pub enum Error {
     /// External dictionaries are not supported.
     DictionaryNotSupported,
     /// Content length differs.
-    ContentLengthError { expected: u64, actual: u64 },
+    ContentLengthError {
+        /// Expected content length.
+        expected: u64,
+        /// Actual content length.
+        actual: u64,
+    },
 }
 
 impl From<Error> for io::Error {
@@ -100,7 +104,7 @@ impl From<io::Error> for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
